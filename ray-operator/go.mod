@@ -88,3 +88,7 @@ require (
 	k8s.io/kube-openapi v0.0.0-20230717233707-2695361300d9 // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
 )
+
+// Temporary fix for CVE-2023-44487
+// To be removed once it's fixed in upstream Kuberay
+replace google.golang.org/grpc => google.golang.org/grpc v1.56.3
