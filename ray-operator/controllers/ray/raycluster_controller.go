@@ -10,6 +10,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/pointer"
 
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler"
@@ -42,6 +43,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+)
+
+const (
+	AnnotationInjectOAuth = "kuberay.opendatahub.io/inject-oauth"
 )
 
 var (
@@ -145,8 +150,12 @@ type RayClusterReconciler struct {
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=extensions,resources=ingresses,verbs=get;list;watch;create;update;delete;patch
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=roles,verbs=get;list;watch;create;delete;update
 // +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=rolebindings,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=clusterrolebindings,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="authentication.k8s.io",resources=tokenreviews,verbs=create
+// +kubebuilder:rbac:groups="authorization.k8s.io",resources=subjectaccessreviews,verbs=create
 
 // [WARNING]: There MUST be a newline after kubebuilder markers.
 
@@ -157,6 +166,32 @@ func (r *RayClusterReconciler) Reconcile(ctx context.Context, request ctrl.Reque
 	// Try to fetch the RayCluster instance
 	instance := &rayv1.RayCluster{}
 	if err = r.Get(ctx, request.NamespacedName, instance); err == nil {
+		r.Log.Info("HEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEERRRRRRRRRRREEEEEEEEEEE")
+		if OAuthInjectionIsEnabled(instance.ObjectMeta) {
+			r.Log.Info("injection is enabled")
+			err = r.ReconcileOAuthServiceAccount(instance, ctx)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// Call the OAuth Service reconciler
+			err = r.ReconcileOAuthService(instance, ctx)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// Call the OAuth Secret reconciler
+			err = r.ReconcileOAuthSecret(instance, ctx)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+
+			// Call the OAuth Route reconciler
+			err = r.ReconcileOAuthRoute(instance, ctx)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 		return r.rayClusterReconcile(ctx, request, instance)
 	}
 
@@ -168,6 +203,17 @@ func (r *RayClusterReconciler) Reconcile(ctx context.Context, request ctrl.Reque
 	}
 	// Error reading the object - requeue the request.
 	return ctrl.Result{}, client.IgnoreNotFound(err)
+}
+
+// OAuthInjectionIsEnabled returns true if the oauth sidecar injection
+// annotation is present in the notebook.
+func OAuthInjectionIsEnabled(meta metav1.ObjectMeta) bool {
+	if meta.Annotations[AnnotationInjectOAuth] != "" {
+		result, _ := strconv.ParseBool(meta.Annotations[AnnotationInjectOAuth])
+		return result
+	} else {
+		return false
+	}
 }
 
 func (r *RayClusterReconciler) rayClusterReconcile(ctx context.Context, request ctrl.Request, instance *rayv1.RayCluster) (ctrl.Result, error) {
@@ -967,6 +1013,111 @@ func (r *RayClusterReconciler) createService(ctx context.Context, raySvc *corev1
 	return nil
 }
 
+func AddOauthSidecar(p *corev1.Pod, instance rayv1.RayCluster) {
+	oauth_container := corev1.Container{
+		Name:            "oauth-proxy",
+		Image:           "registry.redhat.io/openshift4/ose-oauth-proxy@sha256:1ea6a01bf3e63cdcf125c6064cbd4a4a270deaf0f157b3eabb78f60556840366",
+		ImagePullPolicy: corev1.PullAlways,
+		Env: []corev1.EnvVar{{
+			Name: "NAMESPACE",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.namespace",
+				},
+			},
+		}},
+		Args: []string{
+			"--provider=openshift",
+			"--https-address=:8443",
+			"--http-address=",
+			"--openshift-service-account=" + instance.Name,
+			"--cookie-secret-file=/etc/oauth/config/cookie_secret",
+			"--cookie-expire=24h0m0s",
+			"--tls-cert=/etc/tls/private/tls.crt",
+			"--tls-key=/etc/tls/private/tls.key",
+			"--upstream=http://localhost:8265",
+			"--upstream-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+			"--email-domain=*",
+			"--skip-provider-button",
+			`--openshift-sar={"verb":"get","resource":"raycluster","resourceAPIGroup":"ray.io",` +
+				`"resourceName":"` + instance.Name + `","namespace":"$(NAMESPACE)"}`,
+		},
+		Ports: []corev1.ContainerPort{{
+			Name:          OAuthServicePortName,
+			ContainerPort: 8443,
+			Protocol:      corev1.ProtocolTCP,
+		}},
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   "/oauth/healthz",
+					Port:   intstr.FromString(OAuthServicePortName),
+					Scheme: corev1.URISchemeHTTPS,
+				},
+			},
+			InitialDelaySeconds: 30,
+			TimeoutSeconds:      1,
+			PeriodSeconds:       5,
+			SuccessThreshold:    1,
+			FailureThreshold:    3,
+		},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   "/oauth/healthz",
+					Port:   intstr.FromString(OAuthServicePortName),
+					Scheme: corev1.URISchemeHTTPS,
+				},
+			},
+			InitialDelaySeconds: 5,
+			TimeoutSeconds:      1,
+			PeriodSeconds:       5,
+			SuccessThreshold:    1,
+			FailureThreshold:    3,
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				"cpu":    resource.MustParse("100m"),
+				"memory": resource.MustParse("64Mi"),
+			},
+			Limits: corev1.ResourceList{
+				"cpu":    resource.MustParse("100m"),
+				"memory": resource.MustParse("64Mi"),
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "oauth-config",
+				MountPath: "/etc/oauth/config",
+			},
+			{
+				Name:      "tls-certificates",
+				MountPath: "/etc/tls/private",
+			},
+		},
+	}
+	p.Spec.Containers = append(p.Spec.Containers, oauth_container)
+	oauthVolume := corev1.Volume{
+		Name: "oauth-config",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName:  instance.Name + "-oauth-config",
+				DefaultMode: pointer.Int32Ptr(420),
+			},
+		},
+	}
+	tlsVolume := corev1.Volume{
+		Name: "tls-certificates",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName:  instance.Name + "-tls",
+				DefaultMode: pointer.Int32Ptr(420),
+			},
+		},
+	}
+	p.Spec.Volumes = append(p.Spec.Volumes, oauthVolume, tlsVolume)
+}
+
 func (r *RayClusterReconciler) createHeadPod(ctx context.Context, instance rayv1.RayCluster) error {
 	// build the pod then create it
 	pod := r.buildHeadPod(instance)
@@ -980,6 +1131,11 @@ func (r *RayClusterReconciler) createHeadPod(ctx context.Context, instance rayv1
 		} else {
 			return err
 		}
+	}
+
+	if OAuthInjectionIsEnabled(instance.ObjectMeta) {
+		AddOauthSidecar(&pod, instance)
+		pod.Spec.ServiceAccountName = instance.Name
 	}
 
 	r.Log.Info("createHeadPod", "head pod with name", pod.GenerateName)
